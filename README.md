@@ -37,6 +37,25 @@ $ python -m pip install requests
 
 Requests officially supports Python 3.10+.
 
+## Building from source and running tests
+
+Create a virtual environment, install the project with its test dependency
+group, and run the test suite:
+
+```shell
+python -m venv .venv
+# macOS or Linux
+. .venv/bin/activate
+# Windows PowerShell: .venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install --group test -e .
+python -m pytest tests
+```
+
+The test dependency group is defined in `pyproject.toml`. The editable install
+builds Requests from the checked-out source and keeps the working tree connected
+to the installed package.
+
 ## Supported Features & Best–Practices
 
 Requests is ready for the demands of building robust and reliable HTTP–speaking applications, for the needs of today.

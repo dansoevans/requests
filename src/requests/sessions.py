@@ -151,6 +151,83 @@ class SessionRedirectMixin:
             return to_native_string(location, "utf8")
         return None
 
+    @staticmethod
+    def _prepare_redirect_url(
+        redirect_url: str, response_url: str, previous_fragment: str
+    ) -> tuple[str, str]:
+        """Normalize a redirect URL and carry forward its fragment."""
+        # Handle redirection without scheme (see: RFC 1808 Section 4).
+        if redirect_url.startswith("//"):
+            parsed_response_url = urlparse(response_url)
+            redirect_url = ":".join(
+                [to_native_string(parsed_response_url.scheme), redirect_url]
+            )
+
+        # Normalize the URL and attach the previous fragment if needed
+        # (RFC 7231 7.1.2).
+        parsed_redirect_url = urlparse(redirect_url)
+        if parsed_redirect_url.fragment == "" and previous_fragment:
+            parsed_redirect_url = parsed_redirect_url._replace(
+                fragment=previous_fragment
+            )
+        elif parsed_redirect_url.fragment:
+            previous_fragment = parsed_redirect_url.fragment
+        redirect_url = parsed_redirect_url.geturl()
+
+        # Facilitate relative Location headers and percent-encode the URL.
+        if not parsed_redirect_url.netloc:
+            redirect_url = urljoin(response_url, requote_uri(redirect_url))
+        else:
+            redirect_url = requote_uri(redirect_url)
+
+        return redirect_url, previous_fragment
+
+    def _prepare_redirect_request(
+        self,
+        request: PreparedRequest,
+        response: Response,
+        redirect_url: str,
+        proxies: dict[str, str] | None,
+    ) -> tuple[PreparedRequest, dict[str, str]]:
+        """Apply the method, header, cookie, auth, and body changes for a redirect."""
+        prepared_request = request.copy()
+        prepared_request.url = to_native_string(redirect_url)
+        self.rebuild_method(prepared_request, response)
+
+        preserve_request_body = response.status_code in (
+            codes.temporary_redirect,
+            codes.permanent_redirect,
+        )
+        if not preserve_request_body:
+            purged_headers = ("Content-Length", "Content-Type", "Transfer-Encoding")
+            for header in purged_headers:
+                prepared_request.headers.pop(header, None)
+            prepared_request.body = None
+
+        headers = prepared_request.headers
+        headers.pop("Cookie", None)
+
+        # Extract response cookies before merging session cookies into the copy.
+        cookie_jar = cast("CookieJar", prepared_request._cookies)
+        extract_cookies_to_jar(cookie_jar, request, response.raw)
+        merge_cookies(cookie_jar, self.cookies)
+        prepared_request.prepare_cookies(cookie_jar)
+
+        # Rebuild auth and proxy information for the new URL.
+        proxies = self.rebuild_proxies(prepared_request, proxies)
+        self.rebuild_auth(prepared_request, response)
+
+        has_body_position = prepared_request._body_position is not None
+        has_content_length = "Content-Length" in headers
+        has_transfer_encoding = "Transfer-Encoding" in headers
+        can_rewind_body = has_body_position and (
+            has_content_length or has_transfer_encoding
+        )
+        if can_rewind_body:
+            rewind_body(prepared_request)
+
+        return prepared_request, proxies
+
     def should_strip_auth(self, old_url: str, new_url: str) -> bool:
         """Decide whether Authorization header should be removed when redirecting"""
         old_parsed = urlparse(old_url)
@@ -161,23 +238,31 @@ class SessionRedirectMixin:
         # ports. This isn't specified by RFC 7235, but is kept to avoid
         # breaking backwards compatibility with older versions of requests
         # that allowed any redirects on the same host.
-        if (
-            old_parsed.scheme == "http"
-            and old_parsed.port in (80, None)
-            and new_parsed.scheme == "https"
-            and new_parsed.port in (443, None)
-        ):
+        is_http_to_https_redirect = (
+            old_parsed.scheme == "http" and new_parsed.scheme == "https"
+        )
+        uses_default_http_port = old_parsed.port in (DEFAULT_PORTS["http"], None)
+        uses_default_https_port = new_parsed.port in (DEFAULT_PORTS["https"], None)
+        has_default_upgrade_ports = (
+            uses_default_http_port and uses_default_https_port
+        )
+        is_default_http_upgrade = (
+            is_http_to_https_redirect and has_default_upgrade_ports
+        )
+        if is_default_http_upgrade:
             return False
 
         # Handle default port usage corresponding to scheme.
         changed_port = old_parsed.port != new_parsed.port
         changed_scheme = old_parsed.scheme != new_parsed.scheme
         default_port = (DEFAULT_PORTS.get(old_parsed.scheme, None), None)
-        if (
-            not changed_scheme
-            and old_parsed.port in default_port
-            and new_parsed.port in default_port
-        ):
+        same_scheme = old_parsed.scheme == new_parsed.scheme
+        old_uses_default_port = old_parsed.port in default_port
+        new_uses_default_port = new_parsed.port in default_port
+        is_default_port_same_scheme = (
+            same_scheme and old_uses_default_port and new_uses_default_port
+        )
+        if is_default_port_same_scheme:
             return False
 
         # Standard case: root URI must match
@@ -197,16 +282,14 @@ class SessionRedirectMixin:
     ) -> Generator[Response, None, None]:
         """Receives a Response. Returns a generator of Responses or Requests."""
 
-        hist: list[Response] = []  # keep track of history
+        redirect_history: list[Response] = []
 
-        url = self.get_redirect_target(resp)
+        redirect_url = self.get_redirect_target(resp)
         previous_fragment = urlparse(req.url).fragment
-        while url:
-            prepared_request = req.copy()
-
+        while redirect_url:
             # Update history and keep track of redirects.
-            resp.history = hist[:]
-            hist.append(resp)
+            resp.history = redirect_history[:]
+            redirect_history.append(resp)
 
             try:
                 resp.content  # Consume socket so it can be released
@@ -221,67 +304,12 @@ class SessionRedirectMixin:
             # Release the connection back into the pool.
             resp.close()
 
-            # Handle redirection without scheme (see: RFC 1808 Section 4)
-            if url.startswith("//"):
-                parsed_rurl = urlparse(resp.url)
-                url = ":".join([to_native_string(parsed_rurl.scheme), url])
-
-            # Normalize url case and attach previous fragment if needed (RFC 7231 7.1.2)
-            parsed = urlparse(url)
-            if parsed.fragment == "" and previous_fragment:
-                parsed = parsed._replace(fragment=previous_fragment)
-            elif parsed.fragment:
-                previous_fragment = parsed.fragment
-            url = parsed.geturl()
-
-            # Facilitate relative 'location' headers, as allowed by RFC 7231.
-            # (e.g. '/path/to/resource' instead of 'http://domain.tld/path/to/resource')
-            # Compliant with RFC3986, we percent encode the url.
-            if not parsed.netloc:
-                url = urljoin(resp.url, requote_uri(url))
-            else:
-                url = requote_uri(url)
-
-            prepared_request.url = to_native_string(url)
-
-            self.rebuild_method(prepared_request, resp)
-
-            # https://github.com/psf/requests/issues/1084
-            if resp.status_code not in (
-                codes.temporary_redirect,
-                codes.permanent_redirect,
-            ):
-                # https://github.com/psf/requests/issues/3490
-                purged_headers = ("Content-Length", "Content-Type", "Transfer-Encoding")
-                for header in purged_headers:
-                    prepared_request.headers.pop(header, None)
-                prepared_request.body = None
-
-            headers = prepared_request.headers
-            headers.pop("Cookie", None)
-
-            # Extract any cookies sent on the response to the cookiejar
-            # in the new request. Because we've mutated our copied prepared
-            # request, use the old one that we haven't yet touched.
-            cookie_jar = cast("CookieJar", prepared_request._cookies)
-            extract_cookies_to_jar(cookie_jar, req, resp.raw)
-            merge_cookies(cookie_jar, self.cookies)
-            prepared_request.prepare_cookies(cookie_jar)
-
-            # Rebuild auth and proxy information.
-            proxies = self.rebuild_proxies(prepared_request, proxies)
-            self.rebuild_auth(prepared_request, resp)
-
-            # A failed tell() sets `_body_position` to `object()`. This non-None
-            # value ensures `rewindable` will be True, allowing us to raise an
-            # UnrewindableBodyError, instead of hanging the connection.
-            rewindable = prepared_request._body_position is not None and (
-                "Content-Length" in headers or "Transfer-Encoding" in headers
+            redirect_url, previous_fragment = self._prepare_redirect_url(
+                redirect_url, resp.url, previous_fragment
             )
-
-            # Attempt to rewind consumed file-like object.
-            if rewindable:
-                rewind_body(prepared_request)
+            prepared_request, proxies = self._prepare_redirect_request(
+                req, resp, redirect_url, proxies
+            )
 
             # Override the original request.
             req = prepared_request
@@ -303,7 +331,7 @@ class SessionRedirectMixin:
                 extract_cookies_to_jar(self.cookies, prepared_request, resp.raw)
 
                 # extract redirect url, if any, for the next loop
-                url = self.get_redirect_target(resp)
+                redirect_url = self.get_redirect_target(resp)
                 yield resp
 
     def rebuild_auth(

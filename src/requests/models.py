@@ -586,62 +586,17 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
         content_type = None
 
         if not data and json is not None:
-            # urllib3 requires a bytes-like body. Python 2's json.dumps
-            # provides this natively, but Python 3 gives a Unicode string.
             content_type = "application/json"
+            body = self._prepare_json_body(json)
 
-            try:
-                body = complexjson.dumps(json, allow_nan=False)
-            except ValueError as ve:
-                raise InvalidJSONError(ve, request=self)
-
-            if not isinstance(body, bytes):
-                body = body.encode("utf-8")
-
-        # data that proxies attributes to underlying objects needs hasattr
-        is_iterable = isinstance(data, Iterable) or hasattr(data, "__iter__")
-        if is_iterable and not isinstance(data, (str, bytes, list, tuple, Mapping)):
-            try:
-                length = super_len(data)
-            except (TypeError, AttributeError, UnsupportedOperation):
-                length = None
-
-            body = data
-
-            if getattr(body, "tell", None) is not None:
-                # Record the current file position before reading.
-                # This will allow us to rewind a file in the event
-                # of a redirect.
-                try:
-                    self._body_position = body.tell()  # type: ignore[union-attr]  # guarded by getattr check
-                except OSError:
-                    # This differentiates from None, allowing us to catch
-                    # a failed `tell()` later when trying to rewind the body
-                    self._body_position = object()
-
-            if files:
-                raise NotImplementedError(
-                    "Streamed bodies and files are mutually exclusive."
-                )
-
-            if length:
-                self.headers["Content-Length"] = builtin_str(length)
-            else:
-                self.headers["Transfer-Encoding"] = "chunked"
+        if self._is_streaming_body(data):
+            body = self._prepare_streamed_body(data, files)
         else:
             # After is_stream filtering, remaining data is raw (not streamed)
             raw_data = cast("_t.RawDataType | None", data)
-
-            # Multi-part file uploads.
-            if files:
-                (body, content_type) = self._encode_files(files, raw_data)
-            else:
-                if raw_data:
-                    body = self._encode_params(raw_data)
-                    if isinstance(data, basestring) or _t.has_read(data):
-                        content_type = None
-                    else:
-                        content_type = "application/x-www-form-urlencoded"
+            body, content_type = self._prepare_raw_body(
+                raw_data, files, body, content_type
+            )
 
             self.prepare_content_length(body)
 
@@ -650,6 +605,75 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
                 self.headers["Content-Type"] = content_type
 
         self.body = body  # type: ignore[assignment]  # body transforms from DataType to BodyType
+
+    @staticmethod
+    def _is_streaming_body(data: _t.DataType) -> bool:
+        """Return whether data should be sent as a streamed request body."""
+        # Proxies to underlying objects may require the hasattr fallback.
+        is_iterable = isinstance(data, Iterable) or hasattr(data, "__iter__")
+        is_not_raw_data = not isinstance(data, (str, bytes, list, tuple, Mapping))
+        return is_iterable and is_not_raw_data
+
+    def _prepare_json_body(self, json_data: _t.JsonType) -> str | bytes:
+        """Serialize JSON and normalize the result to bytes."""
+        # urllib3 requires a bytes-like body. Python 2's json.dumps provides
+        # this natively, but Python 3 gives a Unicode string.
+        try:
+            body = complexjson.dumps(json_data, allow_nan=False)
+        except ValueError as error:
+            raise InvalidJSONError(error, request=self)
+
+        if not isinstance(body, bytes):
+            body = body.encode("utf-8")
+        return body
+
+    def _prepare_raw_body(
+        self,
+        data: _t.RawDataType | None,
+        files: _t.FilesType,
+        body: _t.BodyType,
+        content_type: str | None,
+    ) -> tuple[_t.BodyType, str | None]:
+        """Encode form data or files while preserving any existing JSON body."""
+        if files:
+            body, content_type = self._encode_files(files, data)
+        elif data:
+            body = self._encode_params(data)
+            if isinstance(data, basestring) or _t.has_read(data):
+                content_type = None
+            else:
+                content_type = "application/x-www-form-urlencoded"
+
+        return body, content_type
+
+    def _prepare_streamed_body(
+        self, data: _t.DataType, files: _t.FilesType
+    ) -> _t.BodyType:
+        """Set streaming body headers and remember its position for redirects."""
+        try:
+            length = super_len(data)
+        except (TypeError, AttributeError, UnsupportedOperation):
+            length = None
+
+        if getattr(data, "tell", None) is not None:
+            # Record the current file position before reading so redirects can rewind.
+            try:
+                self._body_position = data.tell()  # type: ignore[union-attr]  # guarded by getattr check
+            except OSError:
+                # A non-None sentinel lets a later rewind raise UnrewindableBodyError.
+                self._body_position = object()
+
+        if files:
+            raise NotImplementedError(
+                "Streamed bodies and files are mutually exclusive."
+            )
+
+        if length:
+            self.headers["Content-Length"] = builtin_str(length)
+        else:
+            self.headers["Transfer-Encoding"] = "chunked"
+
+        return cast("_t.BodyType", data)
 
     def prepare_content_length(self, body: _t.BodyType) -> None:
         """Prepare Content-Length header based on request method and body"""
